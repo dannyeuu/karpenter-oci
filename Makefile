@@ -1,7 +1,7 @@
 # change the below var to yours before build and apply
 #-------
-CLUSTER_NAME ?= karpenter-oci-test
-CLUSTER_ENDPOINT ?= https://10.0.0.10:6443
+CLUSTER_NAME ?= karpenter-test-132
+CLUSTER_ENDPOINT ?= https://10.0.0.13:6443
 COMPARTMENT_ID ?= ocid1.compartment.oc1..aaaaaaaa
 CLUSTER_DNS ?= 10.96.5.5
 REGION ?= us-ashburn-1
@@ -121,10 +121,9 @@ apply: verify image ## Deploy the controller from the current state of your git 
         --set controller.image.tag=$(IMG_TAG) \
         --set controller.image.digest=$(IMG_DIGEST)
 
-#TODO impl me
 install:  ## Deploy the latest released version into your ~/.kube/config cluster
 	@echo Upgrading to ${KARPENTER_VERSION}
-	helm upgrade --install karpenter oci://iad.ocir.io/${TENANCY_NAMESPACE}/karpenter/karpenter-oci --version ${KARPENTER_VERSION} --namespace ${KARPENTER_NAMESPACE} \
+	helm upgrade --install karpenter karpenter-oci/karpenter --version ${KARPENTER_VERSION} --namespace ${KARPENTER_NAMESPACE} \
 		$(HELM_OPTS)
 
 delete: ## Delete the controller from your ~/.kube/config cluster

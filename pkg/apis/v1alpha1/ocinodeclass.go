@@ -16,6 +16,8 @@ package v1alpha1
 
 import (
 	"fmt"
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/samber/lo"
@@ -29,15 +31,49 @@ const (
 )
 
 type OciNodeClassSpec struct {
-	VcnId                 string                      `json:"vcnId"`
-	ImageSelector         []ImageSelectorTerm         `json:"imageSelector"`
-	SubnetSelector        []SubnetSelectorTerm        `json:"subnetSelector"`
+	VcnId string `json:"vcnId"`
+	// imageSelector is a list of or image selector terms. The terms are ORed.
+	// +kubebuilder:validation:XValidation:message="expected at least one, got none, ['id', 'name']",rule="self.all(x, has(x.id) || has(x.name))"
+	// +kubebuilder:validation:XValidation:message="'id' is mutually exclusive, cannot be set with a combination of other fields in imageSelector",rule="!self.exists(x, has(x.id) && has(x.name))"
+	// +kubebuilder:validation:MinItems:=1
+	// +kubebuilder:validation:MaxItems:=30
+	// +required
+	ImageSelector []ImageSelectorTerm `json:"imageSelector"`
+	// subnetSelector is a list of or subnet selector terms. The terms are ORed.
+	// +kubebuilder:validation:XValidation:message="subnetSelector cannot be empty",rule="self.size() != 0"
+	// +kubebuilder:validation:XValidation:message="expected at least one, got none, ['name', 'id']",rule="self.all(x, has(x.name) || has(x.id))"
+	// +kubebuilder:validation:XValidation:message="'id' is mutually exclusive, cannot be set with a combination of other fields in subnetSelector",rule="!self.all(x, has(x.id) && has(x.name))"
+	// +kubebuilder:validation:MaxItems:=30
+	// +required
+	SubnetSelector []SubnetSelectorTerm `json:"subnetSelector"`
+	// securityGroupSelector is a list of or security group selector terms. The terms are ORed.
+	// +kubebuilder:validation:XValidation:message="expected at least one, got none, ['id', 'name']",rule="self.all(x, has(x.id) || has(x.name))"
+	// +kubebuilder:validation:XValidation:message="'id' is mutually exclusive, cannot be set with a combination of other fields in securityGroupSelector",rule="!self.all(x, has(x.id) && has(x.name))"
+	// +kubebuilder:validation:XValidation:message="'name' is mutually exclusive, cannot be set with a combination of other fields in securityGroupSelector",rule="!self.all(x, has(x.name) && has(x.id))"
+	// +kubebuilder:validation:MaxItems:=30
+	// +required
 	SecurityGroupSelector []SecurityGroupSelectorTerm `json:"securityGroupSelector,omitempty"`
 	UserData              *string                     `json:"userData,omitempty"`
 	PreInstallScript      *string                     `json:"preInstallScript,omitempty"`
 	MetaData              map[string]string           `json:"metaData,omitempty"`
 	ImageFamily           string                      `json:"imageFamily"`
-	Tags                  map[string]string           `json:"tags,omitempty"`
+	// Tags to be applied on instance resources
+	// +kubebuilder:validation:XValidation:message="empty tag keys aren't supported",rule="self.all(k, k != '')"
+	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching kubernetes.io/cluster/",rule="self.all(k, !k.startsWith('kubernetes.io/cluster') )"
+	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching karpenter.sh/nodepool",rule="self.all(k, k != 'karpenter.sh/nodepool')"
+	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching karpenter.sh/nodeclaim",rule="self.all(k, k !='karpenter.sh/nodeclaim')"
+	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching karpenter.sh/managed-by",rule="self.all(k, k !='karpenter.sh/managed-by')"
+	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching karpenter.k8s.oracle/ocinodeclass",rule="self.all(k, k !='karpenter.k8s.oracle/ocinodeclass')"
+	// +optional
+	Tags map[string]string `json:"tags,omitempty"`
+
+	// FreeFormTags contains user-defined tags for OCI resources
+	// +kubebuilder:validation:XValidation:message="freeform tag keys cannot contain spaces",rule="self.all(k, !k.contains(' '))"
+	// +kubebuilder:validation:XValidation:message="freeform tag keys cannot contain dots",rule="self.all(k, !k.contains('.'))"
+	// +kubebuilder:validation:XValidation:message="freeform tag keys cannot exceed 100 characters",rule="self.all(k, size(k) <= 100)"
+	// +kubebuilder:validation:MaxProperties:=10
+	// +optional
+	FreeFormTags map[string]string `json:"freeFormTags,omitempty"`
 	// Kubelet defines args to be used when configuring kubelet on provisioned nodes.
 	// They are a subset of the upstream types, recognizing not all options may be supported.
 	// Wherever possible, the types and names should reflect the upstream kubelet types.
@@ -52,9 +88,16 @@ type OciNodeClassSpec struct {
 	AgentList     []string              `json:"agentList,omitempty"`
 }
 
-// TODO add verification >50Gi <32TB
 type VolumeAttributes struct {
+	// SizeInGBs specifies the size of the block volume in GB.
+	// Must be between 50 and 32768.
+	// +kubebuilder:validation:Minimum=50
+	// +kubebuilder:validation:Maximum=32768
 	SizeInGBs int64 `json:"sizeInGBs"`
+
+	// VpusPerGB specifies the number of volume performance units per GB.
+	// Allowed values: 0 (low cost), 10 (balanced), 20 (high performance).
+	// +kubebuilder:validation:Enum=0;10;20
 	VpusPerGB int64 `json:"vpusPerGB"`
 }
 
@@ -77,14 +120,27 @@ type OciNodeClassStatus struct {
 }
 
 type Subnet struct {
-	Id   string `json:"id,omitempty"`
-	Name string `json:"name,omitempty"`
+	Id              string                   `json:"id,omitempty"`
+	Name            string                   `json:"name,omitempty"`
+	CidrUtilization []CidrUtilizationSummary `json:"cidrUtilization,omitempty"`
+}
+
+type CidrUtilizationSummary struct {
+	// The CIDR range of a subnet.
+	Cidr string `json:"cidr,omitempty"`
+
+	// The CIDR utilisation of a subnet.
+	Utilization string `json:"utilization,omitempty"`
+
+	// Address type of the CIDR within a subnet.
+	AddressType string `json:"addressType,omitempty"`
 }
 
 type Image struct {
-	Id            string `json:"id,omitempty"`
-	Name          string `json:"name,omitempty"`
-	CompartmentId string `json:"compartmentId,omitempty"`
+	Id            string                           `json:"id,omitempty"`
+	Name          string                           `json:"name,omitempty"`
+	CompartmentId string                           `json:"compartmentId,omitempty"`
+	Requirements  []corev1.NodeSelectorRequirement `json:"requirements,omitempty"`
 }
 
 type SecurityGroup struct {
@@ -93,7 +149,13 @@ type SecurityGroup struct {
 }
 
 type ImageSelectorTerm struct {
-	Id            string `json:"id,omitempty"`
+	// ID is the ami id in instance
+	// +kubebuilder:validation:Pattern:="ocid1.image.[0-9a-z]+"
+	// +optional
+	Id string `json:"id,omitempty"`
+	// Name is the image name in instance.
+	// This value is the name field, which is different from the name tag.
+	// +optional
 	Name          string `json:"name,omitempty"`
 	CompartmentId string `json:"compartmentId,omitempty"`
 }
@@ -123,21 +185,24 @@ type LaunchOptions struct {
 	// volumes on platform images.
 	// * `PARAVIRTUALIZED` - Paravirtualized disk. This is the default for boot volumes and remote block
 	// storage volumes on platform images.
-	BootVolumeType string `mandatory:"false" json:"bootVolumeType,omitempty"`
+	// +kubebuilder:validation:Enum=ISCSI;SCSI;IDE;VFIO;PARAVIRTUALIZED
+	BootVolumeType *string `mandatory:"false" json:"bootVolumeType,omitempty"`
 
 	// Firmware used to boot VM. Select the option that matches your operating system.
 	// * `BIOS` - Boot VM using BIOS style firmware. This is compatible with both 32 bit and 64 bit operating
 	// systems that boot using MBR style bootloaders.
 	// * `UEFI_64` - Boot VM using UEFI style firmware compatible with 64 bit operating systems. This is the
 	// default for platform images.
-	Firmware string `mandatory:"false" json:"firmware,omitempty"`
+	// +kubebuilder:validation:Enum=BIOS;UEFI_64
+	Firmware *string `mandatory:"false" json:"firmware,omitempty"`
 
 	// Emulation type for the physical network interface card (NIC).
 	// * `E1000` - Emulated Gigabit ethernet controller. Compatible with Linux e1000 network driver.
 	// * `VFIO` - Direct attached Virtual Function network controller. This is the networking type
 	// when you launch an instance using hardware-assisted (SR-IOV) networking.
 	// * `PARAVIRTUALIZED` - VM instances launch with paravirtualized devices using VirtIO drivers.
-	NetworkType string `mandatory:"false" json:"networkType,omitempty"`
+	// +kubebuilder:validation:Enum=E1000;VFIO;PARAVIRTUALIZED
+	NetworkType *string `mandatory:"false" json:"networkType,omitempty"`
 
 	// Emulation type for volume.
 	// * `ISCSI` - ISCSI attached block storage device.
@@ -147,10 +212,11 @@ type LaunchOptions struct {
 	// volumes on platform images.
 	// * `PARAVIRTUALIZED` - Paravirtualized disk. This is the default for boot volumes and remote block
 	// storage volumes on platform images.
-	RemoteDataVolumeType string `mandatory:"false" json:"remoteDataVolumeType,omitempty"`
+	// +kubebuilder:validation:Enum=ISCSI;SCSI;IDE;VFIO;PARAVIRTUALIZED
+	RemoteDataVolumeType *string `mandatory:"false" json:"remoteDataVolumeType,omitempty"`
 
 	// Whether to enable consistent volume naming feature. Defaults to false.
-	IsConsistentVolumeNamingEnabled bool `mandatory:"false" json:"isConsistentVolumeNamingEnabled,omitempty"`
+	IsConsistentVolumeNamingEnabled *bool `mandatory:"false" json:"isConsistentVolumeNamingEnabled,omitempty"`
 }
 
 type KubeletConfiguration struct {

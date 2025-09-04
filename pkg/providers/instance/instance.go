@@ -17,6 +17,10 @@ package instance
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/core"
 	"github.com/samber/lo"
@@ -30,13 +34,10 @@ import (
 	"github.com/zoom/karpenter-oci/pkg/providers/subnet"
 	"github.com/zoom/karpenter-oci/pkg/utils"
 	v1 "k8s.io/api/core/v1"
-	"net/http"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	corev1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
-	"strconv"
-	"strings"
 )
 
 type Provider struct {
@@ -60,19 +61,15 @@ func NewProvider(compClient api.ComputeClient, subnetProvider *subnet.Provider, 
 }
 
 func (p *Provider) Create(ctx context.Context, nodeClass *v1alpha1.OciNodeClass, nodeClaim *corev1.NodeClaim, instanceTypes []*corecloudprovider.InstanceType) (*core.Instance, error) {
-	subnets, err := p.subnetProvider.List(ctx, nodeClass)
+	subnet, count, err := p.FindLeastUtilizedSubnet(ctx, nodeClass)
 	if err != nil {
 		return nil, err
 	}
-	if len(subnets) == 0 {
-		return nil, fmt.Errorf("no subnets found for vcn: %s, selector: %v", nodeClass.Spec.VcnId, nodeClass.Spec.SubnetSelector)
+	if nodeClaim != nil && nodeClaim.Spec.Resources.Requests.Pods().Value() > int64(count) {
+		return nil, fmt.Errorf("not enough IPs are available on all subnets")
 	}
-	sgs, err := p.securityGroupProvider.List(ctx, nodeClass)
-	if err != nil {
-		return nil, err
-	}
-	sgsIds := lo.Map[core.NetworkSecurityGroup, string](sgs, func(item core.NetworkSecurityGroup, index int) string {
-		return utils.ToString(item.Id)
+	sgsIds := lo.Map[*v1alpha1.SecurityGroup, string](nodeClass.Status.SecurityGroups, func(item *v1alpha1.SecurityGroup, index int) string {
+		return item.Id
 	})
 	instanceType, zone := pickBestInstanceType(nodeClaim, instanceTypes)
 	ad, ok := lo.Find(options.FromContext(ctx).AvailableDomains, func(item string) bool {
@@ -98,12 +95,15 @@ func (p *Provider) Create(ctx context.Context, nodeClass *v1alpha1.OciNodeClass,
 	}
 	metadata := make(map[string]string, 0)
 	if nodeClass.Spec.MetaData != nil {
-		metadata = nodeClass.Spec.MetaData
+		// Create a proper copy of the map instead of just assigning the reference
+		for k, v := range nodeClass.Spec.MetaData {
+			metadata[k] = v
+		}
 	}
 	// insert max pod and subnet info
 	if metadata["oke-native-pod-networking"] == "true" {
 		metadata["oke-max-pods"] = fmt.Sprint(instanceType.Capacity.Pods().Value())
-		metadata["pod-subnets"] = utils.ToString(subnets[0].Id)
+		metadata["pod-subnets"] = utils.ToString(subnet.Id)
 	}
 	userdata, err := template[0].UserData.Script()
 	if err != nil {
@@ -117,8 +117,7 @@ func (p *Provider) Create(ctx context.Context, nodeClass *v1alpha1.OciNodeClass,
 		capacityType = v1alpha1.CapacityTypePreemptible
 	}
 	req := core.LaunchInstanceRequest{LaunchInstanceDetails: core.LaunchInstanceDetails{
-		// todo subnet id balance
-		CreateVnicDetails:       &core.CreateVnicDetails{SubnetId: subnets[0].Id, NsgIds: sgsIds},
+		CreateVnicDetails:       &core.CreateVnicDetails{SubnetId: subnet.Id, NsgIds: sgsIds},
 		LaunchVolumeAttachments: blockDevices,
 		SourceDetails: core.InstanceSourceViaImageDetails{
 			ImageId:             common.String(template[0].ImageId),
@@ -152,9 +151,9 @@ func (p *Provider) Create(ctx context.Context, nodeClass *v1alpha1.OciNodeClass,
 		memoryInMi, _ := strconv.Atoi(memoryInMiVal[0])
 		// Determine if it's an A1 shape (1 OCPU = 1 vCPU), otherwise assume 1 OCPU = 2 vCPU
 		ocpus := float32(vcpu)
-			if !utils.IsA1FlexShape(instanceType.Name) {
-			    ocpus = ocpus / 2.0
-			}
+		if !utils.IsA1FlexShape(instanceType.Name) {
+			ocpus = ocpus / 2.0
+		}
 		req.ShapeConfig = &core.LaunchInstanceShapeConfigDetails{
 			MemoryInGBs: common.Float32(float32(memoryInMi / 1024)),
 			Ocpus:       common.Float32(float32(ocpus))}
@@ -182,11 +181,37 @@ func (p *Provider) Create(ctx context.Context, nodeClass *v1alpha1.OciNodeClass,
 	return &resp.Instance, nil
 }
 
+func (p *Provider) FindLeastUtilizedSubnet(ctx context.Context, nodeClass *v1alpha1.OciNodeClass) (*core.Subnet, int, error) {
+	subnets, err := p.subnetProvider.List(ctx, nodeClass)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(subnets) == 0 {
+		return nil, 0, fmt.Errorf("no subnets found for vcn: %s, selector: %v", nodeClass.Spec.VcnId, nodeClass.Spec.SubnetSelector)
+	}
+	var subnet *core.Subnet
+	availableIPCount := 0
+	subnet = &subnets[0]
+	for i := range subnets {
+		count, err1 := p.subnetProvider.GetSubnetAvailableIPv4Count(ctx, &subnets[i])
+		if err1 != nil {
+			err = err1
+			return nil, 0, fmt.Errorf("GetSubnetAvailableIPv4Count failed. subnet:%s, error:%s", *subnets[i].Id, err.Error())
+		}
+		if count > availableIPCount {
+			subnet = &subnets[i]
+			availableIPCount = count
+		}
+	}
+	return subnet, availableIPCount, nil
+}
+
 func getTags(ctx context.Context, nodeClass *v1alpha1.OciNodeClass, nodeClaim *corev1.NodeClaim) map[string]interface{} {
 	staticTags := map[string]string{
 		corev1.NodePoolLabelKey:         nodeClaim.Labels[corev1.NodePoolLabelKey],
 		v1alpha1.ManagedByAnnotationKey: options.FromContext(ctx).ClusterName,
 		v1alpha1.LabelNodeClass:         nodeClass.Name,
+		v1alpha1.LabelNodeClaim:         nodeClaim.Name,
 	}
 	return removeExcludingChars(48, staticTags, nodeClass.Spec.Tags)
 }
@@ -240,13 +265,14 @@ func (p *Provider) Delete(ctx context.Context, id string) error {
 		PreserveBootVolume:                 common.Bool(false),
 		PreserveDataVolumesCreatedAtLaunch: common.Bool(false)}
 	resp, err := p.compClient.TerminateInstance(ctx, req)
-	if err != nil {
-		return err
+	if resp.HTTPResponse() != nil {
+		statusCode := resp.HTTPResponse().StatusCode
+		if statusCode == http.StatusNotFound || statusCode == http.StatusNoContent {
+			return corecloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("instance already terminated"))
+		}
 	}
-	if resp.HTTPResponse().StatusCode == http.StatusNotFound || resp.HTTPResponse().StatusCode == http.StatusNoContent {
-		return corecloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("instance already terminated"))
-	}
-	return nil
+
+	return err
 }
 
 func (p *Provider) Get(ctx context.Context, id string) (*core.Instance, error) {
@@ -317,4 +343,20 @@ func (p *Provider) GetSubnets(ctx context.Context, vnics []core.VnicAttachment, 
 func (p *Provider) GetSecurityGroups(ctx context.Context, vnics []core.VnicAttachment, onlyPrimaryNic bool) ([]core.NetworkSecurityGroup, error) {
 
 	return p.securityGroupProvider.GetSecurityGroups(ctx, vnics, onlyPrimaryNic)
+}
+
+func (p *Provider) CreateTags(ctx context.Context, id string, tags map[string]string) error {
+	resp, err := p.compClient.UpdateInstance(ctx, core.UpdateInstanceRequest{
+		InstanceId: lo.ToPtr(id),
+		UpdateInstanceDetails: core.UpdateInstanceDetails{
+			FreeformTags: tags,
+		},
+	})
+	if resp.HTTPResponse() != nil && (resp.HTTPResponse().StatusCode == http.StatusNotFound || resp.HTTPResponse().StatusCode == http.StatusNoContent) {
+		return corecloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("tagging instance, %w", err))
+	}
+	if err != nil {
+		return fmt.Errorf("tagging instance, %w", err)
+	}
+	return nil
 }
